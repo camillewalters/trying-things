@@ -1,0 +1,300 @@
+/*
+ * Copyright (c) Dematic GmbH 2018. All rights reserved. Confidential.
+ */
+package com.dematic.fep.ecomm.tests;
+
+import java.lang.reflect.Array;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import com.dematic.fep.ecomm.lib.diqcontroller.PickOrderBuilder;
+import com.googlecode.gwt.crypto.util.Str;
+import org.apache.commons.io.input.BOMInputStream;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.testng.annotations.*;
+import com.dematic.fep.ecomm.lib.BaseTest;
+import com.dematic.fep.ecomm.lib.settings.Ecomm;
+import com.google.common.base.Stopwatch;
+
+
+public class OutboundVolumeTest extends BaseTest {
+
+   private static final Logger LOG = LoggerFactory.getLogger(OutboundVolumeTest.class);
+
+   private static final double testSpeed = 1.5D;
+
+   private static List<String> skus;
+   private static List<String> vasSkus = Arrays.asList("VAS001", "VAS002");
+
+
+   @Parameters({"numSkus", "numPutwallContainers", "numPutwalls", "numPickZones"})
+   @BeforeClass
+   public void beforeClass(@Optional("20") int numSkus, @Optional("50") int numPutwallContainers, @Optional("12") int numPutwalls, @Optional("12") int numPickZones) throws Exception {
+      LOG.debug("Before class");
+
+      base.backgroundProcesses().stop(Ecomm.BackgroundProcess.PWA1002);
+      List<String> putwallsToDisable = base.site().getZoneNames(Ecomm.RoutingArea.PUTWALL);
+      putwallsToDisable = putwallsToDisable.subList(numPutwalls, putwallsToDisable.size());
+      base.dbUtils().getDbPutWalls().plannable(putwallsToDisable, false);
+
+
+      // base.resetEmulation();
+      base.sleep(20, TimeUnit.SECONDS);
+
+      base.hostMessages().buildSku()
+              .sku(vasSkus);
+//             .createRunWait();
+
+      skus = base.hostMessages().buildSku()
+              .skuCount(numSkus, "UNIT%03d")
+              .uom("EA")
+              .unitWeight(10)
+              .includeSkuAsProductCode(true)
+              .productCodesPerUnit(2)
+              .createRunWait()
+              .getSkuIds();
+
+      //List<String> zoneNames = base.site().getZoneNames(Ecomm.RoutingArea.PUTAWAY);
+      List<String> zoneNames = base.site().getZoneNames(Ecomm.RoutingArea.PUTAWAY).subList(0, numPickZones);
+      List<String> locations = base.site().getLocations(Ecomm.RoutingArea.PUTAWAY, skus.size(), zoneNames);
+      base.hostMessages().buildInventoryAdjustment()
+              .sku(skus)
+              .quantity(1000)
+              .location(locations)
+              .createRunWait();
+
+      String vasZone = base.site().getZoneName(Ecomm.RoutingArea.PACKING, 2);
+      List<String> vasLocations = base.site().getLocations(Ecomm.RoutingArea.PACKING, vasSkus.size(), vasZone);
+      base.hostMessages().buildInventoryAdjustment()
+              .sku(vasSkus)
+              .quantity(1000)
+              .location(vasLocations)
+              .createRunWait();
+
+      //base.site().getZoneConfiguration(Ecomm.RoutingArea.PUTAWAY, 0).
+
+      // Induct totes at each active putwall (Putwalls 1-12)
+      List<String> putwalls = base.site().getZoneNames(Ecomm.RoutingArea.PUTWALL).subList(0, numPutwalls);
+//      List<String> putwalls = base.site().getZoneNames(Ecomm.RoutingArea.PUTWALL);
+      for (String putwall : putwalls) {
+         List<String> pwContainers = base.containers().getContainerIds(numPutwallContainers, "FPW%06d");
+         String inductAtPutwall = base.site().getZoneConfiguration(Ecomm.RoutingArea.PUTWALL, putwall).getDestination()
+                 .getInduction();
+         base.emulation().inductTotes(pwContainers, inductAtPutwall);
+      }
+   }
+
+   @BeforeMethod
+   private void beforeMethod() throws Exception {
+      LOG.debug("Before method");
+      base.emulation().play(testSpeed);
+   }
+
+   @AfterMethod
+   private void afterMethod() throws Exception {
+      LOG.debug("After method");
+      base.emulation().play();
+   }
+
+   @Parameters({"iterations", "orderSize", "ignoreErrors", "verifyOrders", "VAS"})
+   @Test
+   public void test(
+           @Optional("1") int iterations, @Optional("100") int orderSize, @Optional("false") boolean ignoreErrors, @Optional("false") boolean verifyOrders, @Optional("false") boolean VAS)
+           throws Exception {
+      Stopwatch stopwatch = Stopwatch.createStarted();
+      base.site().getSettings().get("site");
+      String destination = base.site().getZoneConfiguration(Ecomm.RoutingArea.SHIPPING, 0).getZone();
+
+// sets customerOrders, 80% mlnu and 20% slsu, 10% of the 80% mlnu orders are VAS orders.
+      List<String> expectedCustomerOrders = new ArrayList<>();
+      int mlNuOrderSize = (int) Math.round(orderSize * 0.8);
+      int slSuOrderSize = (int) Math.round(orderSize * 0.2);
+      int vasOrderSize = 0;
+      if (VAS) {
+         vasOrderSize = (int) Math.round(mlNuOrderSize * 0.1);
+         mlNuOrderSize = mlNuOrderSize - vasOrderSize;
+      }
+
+      for (int i = 0; i < iterations; i++) {
+
+         int[] linesInOrder = {2, 2, 3, 4, 3, 2};
+         int[] quantity = {1, 2, 1, 2, 3, 4, 1, 5, 1};
+
+// calls 3 methods below that create the orders
+         List<String> customerOrderIds = MLNUorderTest(mlNuOrderSize, destination, i, linesInOrder, quantity);
+         List<String> slsuCustomerOrderIds = SLSUorderTest(slSuOrderSize, destination, i);
+         List<String> vasCustomerOrderIds = VASorderTest(vasOrderSize, i, linesInOrder, quantity, destination);
+
+//adds all the orders into 1 List 
+         customerOrderIds.addAll(slsuCustomerOrderIds);
+         customerOrderIds.addAll(vasCustomerOrderIds);
+
+         expectedCustomerOrders.addAll(customerOrderIds);
+
+         List<String> outstandingCustomerOrders = new ArrayList<>(customerOrderIds);
+         while (!outstandingCustomerOrders.isEmpty()) {
+            LocalDateTime batchStartTime = LocalDateTime.now();
+            base.cronJobs().runOnce(Ecomm.CronJob.PLANNING_START_DEMON);
+            base.sleep(30, TimeUnit.SECONDS);
+            // Update the list of customer orders still needing to be Released by the "Planning Start Daemon"
+            outstandingCustomerOrders = removeOrdersByStatus(outstandingCustomerOrders, Ecomm.Status.Released.getValue(), true);
+
+            List<String> supplyOrders = base.dbUtils().orderUtils().getNewSupplyOrderIds(batchStartTime);
+            LOG.info("New supply orders {}", supplyOrders);
+            //supplyOrders = filterOrdersByStatus(supplyOrders, Ecomm.Status.Picked.getValue(), false);
+            try {
+               // Wait 10 minutes for the current list of supply orders to be picked
+               waitForOrdersToReachState(supplyOrders, Ecomm.Status.Picked, 1, 10, TimeUnit.MINUTES);
+            } catch (Exception e) {
+               if (!ignoreErrors)
+                  throw e;
+            }
+            // Filter the outstanding customer orders, that have been released.
+            outstandingCustomerOrders = removeOrdersByStatus(outstandingCustomerOrders, Ecomm.Status.Released.getValue(), true);
+            LOG.info("{} outstanding orders - {}", outstandingCustomerOrders.size(), outstandingCustomerOrders);
+         }
+
+         if (verifyOrders) {
+            try {
+               // Give all the customer orders 30 minutes to be completed. If ignore errors, release the next batch otherwise fail
+               waitForOrdersToReachState(customerOrderIds, Ecomm.Status.Complete, 1, 30, TimeUnit.MINUTES);
+            } catch (Exception e) {
+               if (!ignoreErrors)
+                  throw e;
+            }
+         }
+
+      }
+      //Execute the planning start demon one last time to pick up the last of the work.
+      //base.cronJobs().runOnce(Ecomm.CronJob.PLANNING_START_DEMON);
+      //base.sleep(10, TimeUnit.SECONDS);
+      //One final check for all orders to complete
+      base.dbUtils().orderUtils().waitForOrderStatus(Ecomm.Status.Complete, expectedCustomerOrders, 30, TimeUnit.MINUTES);
+      base.lmaValidator().customerOrders("OrdersComplete");
+
+      stopwatch.stop();
+      long timeElapsed = stopwatch.elapsed(TimeUnit.SECONDS);
+      System.out.println("Time Elapsed: " + timeElapsed);
+
+   }
+
+   private List<String> VASorderTest(int vasOrderSize, int i, int[] linesInOrder, int[] quantity, String destination) {
+
+      LOG.info("Starting iteration {} - Create {} new orders", i + 1, vasOrderSize);
+      List<String> customerOrderIds = base.getOrderIds("VAS-ORDR", vasOrderSize);
+
+      base.hostMessages().buildPickOrder()
+              .order(customerOrderIds)
+              .linesInOrder(linesInOrder)
+              .destinationLocation(destination)
+              .sku(skus)
+              .weight(10)
+              .quantity(quantity)
+              .linesInOrderVas(1)
+              .vasRequirement("VAS")
+              .quantityVas(1)
+              .skuVas(vasSkus)
+              .createRunWait();
+
+         return customerOrderIds;
+
+
+   }
+      private List<String> MLNUorderTest(int mlnuOrderSize, String destination, int i, int[] linesInOrder, int[] quantity){
+
+         LOG.info("Starting iteration {} - Create {} new orders", i + 1, mlnuOrderSize);
+         List<String> customerOrderIds = base.getOrderIds("MLNU-ORDR", mlnuOrderSize);
+
+         //MlNu Orders
+         base.hostMessages().buildPickOrder()
+                 .order(customerOrderIds)
+                 .vasRequirement("NONE")
+                 .linesInOrder(linesInOrder)
+                 .destinationLocation(destination)
+                 .sku(skus)
+                 .weight(10)
+                 .quantity(quantity)
+                 .createRunWait();
+
+         return customerOrderIds;
+   }
+
+
+   private List<String> SLSUorderTest(int slsuOrderSize, String destination, int i) {
+      LOG.info("Starting iteration {} - Create {} new orders", i + 1, slsuOrderSize);
+      List<String> customerOrderIds = base.getOrderIds("SLSU-ORDR", slsuOrderSize);
+      PickOrderBuilder pob = base.hostMessages().buildPickOrder();
+
+      //SlSu Orders
+      pob.order(customerOrderIds)
+              .vasRequirement("NONE")
+              .linesInOrder(1)
+              .destinationLocation(destination)
+              .sku(skus)
+              .weight(10)
+              .quantity(1)
+              .createRunWait();
+
+      return customerOrderIds;
+
+   }
+
+   private void waitForOrdersToCompleteState(List<String> orders, String orderState, long retryInterval, long timeout, TimeUnit timeUnit) {
+
+   }
+
+   private void waitForOrdersToReachState(List<String> orders, Ecomm.Status orderStatus, long retryInterval, long timeout, TimeUnit timeUnit) {
+      List<String> pendingOrders = new ArrayList<>(orders);
+      Instant start = Instant.now();
+      while(!pendingOrders.isEmpty()) {
+         pendingOrders = removeOrdersByStatus(pendingOrders, orderStatus.getValue(), true);
+         LOG.info("Wait for remaining orders to reach {} - {}", orderStatus, pendingOrders);
+         try {
+            base.dbUtils().orderUtils().waitForOrderStatus(orderStatus, pendingOrders, retryInterval, timeUnit);
+            pendingOrders = removeOrdersByStatus(pendingOrders, orderStatus.getValue(), true);
+         } catch (Exception e) {
+            LOG.warn("Wait for orders to reach '{}' - {}/{} orders complete. {} orders pending",
+                    orderStatus, orders.size()-pendingOrders.size(), orders.size(), pendingOrders.size());
+            if (Duration.between(start, Instant.now()).toMillis() > TimeUnit.MILLISECONDS.convert(timeout, timeUnit)){
+               pendingOrders = removeOrdersByStatus(pendingOrders, orderStatus.getValue(), true);
+               LOG.error("Timeout {} {} - Wait for orders to reach '{}'\n Outstanding orders: {}\n\n",
+                       timeout, timeUnit, orderStatus, pendingOrders);
+               throw e;
+            }
+         }
+      }
+      LOG.info("Wait for orders to reach '{}' - {}/{} orders complete. {} orders pending",
+              orderStatus, orders.size()-pendingOrders.size(), orders.size(), pendingOrders.size());
+   }
+
+   private List<String> filterOrdersByStatus(List<String> orders, String orderStatus, boolean equals){
+      List<String> result = orders.stream()
+              .filter((x)->{return (orderStatus.equals(base.dbUtils().orderUtils().getOrderStatus(x)) == equals);})
+              .collect(Collectors.toList());
+      LOG.info("Orders Filtered (State: {}={}) - {}", orderStatus, equals, result);
+      return result;
+   }
+
+   private List<String> removeOrdersByStatus(List<String> orders, String orderStatus, boolean equals){
+      // Find all the orderIds that are in given state and remove from the list of outstanding orders
+      List<String> removeOrders = new ArrayList<>();
+      for (String orderId: orders) {
+         String State = base.dbUtils().orderUtils().getOrderStatus(orderId);
+         if (orderStatus.equals(State) == equals) {
+            removeOrders.add(orderId);
+         }
+      }
+      orders.removeAll(removeOrders);
+      //LOG.info("Orders with status '{}' removed - {}", orderStatus, removeOrders);
+      return new ArrayList<>(orders);
+   }
+
+}
